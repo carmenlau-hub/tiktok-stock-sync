@@ -5,14 +5,14 @@ Mister Mobile Singapore
 Everything lives in this one file on purpose: with no second module there is
 nothing that can fall out of sync when re-uploading to GitHub.
 
-BUILD: 2026-08-02c
+BUILD: 2026-08-02d
 """
 
 from __future__ import annotations
 
-
 import io
 import re
+import traceback
 from dataclasses import dataclass, field
 from datetime import datetime
 from difflib import SequenceMatcher
@@ -33,10 +33,6 @@ MM_INK = "333333"      # body text
 WHITE = "FFFFFF"
 LIGHT = "FFFCE6"       # pale yellow tint
 AMBER = "FFF7CC"       # editable "please fill this in" columns
-GREEN = "E2EFDA"
-RED = "FCE4E4"
-
-NAVY = MM_BLACK  # backwards-compatible alias
 
 REGISTRY_SHEETS = [
     "Locked Matches",
@@ -50,8 +46,7 @@ REGISTRY_SHEETS = [
 SKU_LOOKUP_SHEET = "_TikTokSKUs"
 
 # TikTok "Template" sheet layout (fixed by TikTok Seller Center export)
-TT_HEADER_KEY_ROW = 1      # product_id / sku_id / quantity ...
-TT_LABEL_ROW = 3           # "Product ID" / "SKU ID" / "Quantity" ...
+TT_HEADER_KEY_ROW = 1
 TT_FIRST_DATA_ROW = 6
 TT_REQUIRED_KEYS = ["product_id", "product_name", "sku_id", "quantity"]
 
@@ -60,7 +55,7 @@ DECISION_LINK = "Linked (fill col H)"
 DECISION_NOT_SELLING = "Not Selling in TikTok"
 DECISION_NOT_ON_TIKTOK = "Not on TikTok yet"
 DECISION_PENDING = ""
-DECISIONS = [DECISION_PENDING, DECISION_LINK, DECISION_NOT_SELLING, DECISION_NOT_ON_TIKTOK]
+DECISION_OPTIONS = [DECISION_PENDING, DECISION_LINK, DECISION_NOT_SELLING, DECISION_NOT_ON_TIKTOK]
 DECISION_CHOICES = [DECISION_LINK, DECISION_NOT_SELLING, DECISION_NOT_ON_TIKTOK]
 
 
@@ -90,29 +85,22 @@ def to_int(v, default=0) -> int:
         return default
 
 
+def dim(value, default=0) -> int:
+    """
+    openpyxl returns None for max_row / max_column on worksheets that carry no
+    stored dimension record (common for sheets holding only a header row, and
+    for any sheet opened in read-only mode). Never do arithmetic on those
+    values directly.
+    """
+    return default if value is None else int(value)
+
+
 _norm_re = re.compile(r"[^a-z0-9]+")
 
 
 def norm(text: str) -> str:
     """Lowercase alphanumeric token string used for fuzzy comparison."""
     return _norm_re.sub(" ", s(text).lower()).strip()
-
-
-def tokens(text: str) -> set:
-    return {t for t in norm(text).split() if t}
-
-
-def similarity(a: str, b: str) -> float:
-    """Blend of token overlap, coverage and sequence ratio, 0..1."""
-    na, nb = norm(a), norm(b)
-    if not na or not nb:
-        return 0.0
-    ta, tb = set(na.split()), set(nb.split())
-    inter = len(ta & tb)
-    jac = inter / len(ta | tb) if (ta | tb) else 0.0
-    cover = inter / min(len(ta), len(tb)) if ta and tb else 0.0
-    seq = SequenceMatcher(None, na, nb).ratio()
-    return 0.40 * jac + 0.35 * cover + 0.25 * seq
 
 
 def split_ids(v) -> list:
@@ -162,7 +150,7 @@ class PosItem:
 
 @dataclass
 class TtRow:
-    row: int                 # 1-based row index in the Template sheet
+    row: int
     product_id: str = ""
     category: str = ""
     product_name: str = ""
@@ -184,11 +172,11 @@ class TtRow:
 
 @dataclass
 class ParsedRegistry:
-    locked: dict = field(default_factory=dict)        # tt_sku_id -> [pos_id, ...]
-    match_review: set = field(default_factory=set)    # tt_sku_id
-    not_selling: set = field(default_factory=set)     # pos_id
-    not_on_tiktok: set = field(default_factory=set)   # pos_id
-    new_decisions: dict = field(default_factory=dict) # pos_id -> (decision, tt_sku_id, notes)
+    locked: dict = field(default_factory=dict)
+    match_review: set = field(default_factory=set)
+    not_selling: set = field(default_factory=set)
+    not_on_tiktok: set = field(default_factory=set)
+    new_decisions: dict = field(default_factory=dict)
     sheets_found: list = field(default_factory=list)
     warnings: list = field(default_factory=list)
 
@@ -217,10 +205,9 @@ def parse_pos_masterlist(file_bytes: bytes) -> tuple:
     """
     Returns (dict[pos_id -> PosItem], warnings list).
 
-    Handles the POS stock report layout where row 1 holds group headers
-    (Stock Type ID / Category / Brand / Model / Color / Total / <branches>)
-    and row 2 holds sub-headers ("Available Quantity", "Reserved Quantity"...).
-    Available Qty is taken from the FIRST column whose row-2 label is
+    Handles the POS stock report layout where row 1 holds group headers and
+    row 2 holds sub-headers ("Available Quantity", "Reserved Quantity"...).
+    Available Qty comes from the FIRST column whose row-2 label is
     'Available Quantity' — the company-wide Total block.
     """
     warnings: list = []
@@ -328,7 +315,7 @@ def parse_tiktok_template(file_bytes: bytes) -> tuple:
     ws = wb["Template"]
 
     keys = {}
-    for c in range(1, ws.max_column + 1):
+    for c in range(1, dim(ws.max_column) + 1):
         k = norm(ws.cell(TT_HEADER_KEY_ROW, c).value).replace(" ", "_")
         if k:
             keys[k] = c
@@ -342,7 +329,7 @@ def parse_tiktok_template(file_bytes: bytes) -> tuple:
         )
 
     rows: list = []
-    for r in range(TT_FIRST_DATA_ROW, ws.max_row + 1):
+    for r in range(TT_FIRST_DATA_ROW, dim(ws.max_row) + 1):
         sku = s(ws.cell(r, keys["sku_id"]).value)
         pid = s(ws.cell(r, keys["product_id"]).value)
         if not sku and not pid:
@@ -367,13 +354,12 @@ def parse_tiktok_template(file_bytes: bytes) -> tuple:
     if not rows:
         raise SyncError("TikTok Template sheet contains no listing rows (expected data from row 6).")
 
-    meta = {
+    return rows, {
         "quantity_col": keys["quantity"],
         "sku_col": keys["sku_id"],
         "columns": keys,
         "row_count": len(rows),
     }
-    return rows, meta
 
 
 # --------------------------------------------------------------------------
@@ -381,11 +367,23 @@ def parse_tiktok_template(file_bytes: bytes) -> tuple:
 # --------------------------------------------------------------------------
 
 def _header_index(ws) -> dict:
+    """
+    Map normalised header text -> 1-based column number, read from row 1.
+
+    Reads the row itself rather than trusting ws.max_column, which is None on
+    sheets with no stored dimension record.
+    """
     idx = {}
-    for c in range(1, ws.max_column + 1):
-        h = norm(ws.cell(1, c).value)
-        if h:
-            idx[h] = c
+    try:
+        first = next(ws.iter_rows(min_row=1, max_row=1, values_only=True), None)
+    except (StopIteration, ValueError):
+        first = None
+    if not first:
+        return idx
+    for i, v in enumerate(first, start=1):
+        h = norm(v)
+        if h and h not in idx:
+            idx[h] = i
     return idx
 
 
@@ -400,6 +398,14 @@ def _find_col(idx: dict, *candidates):
             if n and n in k:
                 return v
     return None
+
+
+def _cell(row_tuple, col_1based):
+    """Safe positional read out of a values_only row tuple."""
+    if not col_1based:
+        return ""
+    i = col_1based - 1
+    return s(row_tuple[i]) if 0 <= i < len(row_tuple) else ""
 
 
 def parse_registry(file_bytes: bytes | None) -> ParsedRegistry:
@@ -427,10 +433,12 @@ def parse_registry(file_bytes: bytes | None) -> ParsedRegistry:
         c_sku = _find_col(idx, "sku id", "variation id", "tiktok sku id", "tiktok variation id")
         c_ml = _find_col(idx, "locked masterlist id s", "locked masterlist id", "masterlist id")
         if c_sku is None or c_ml is None:
-            reg.warnings.append("'Locked Matches' is missing a SKU ID or LOCKED Masterlist ID(s) column.")
+            reg.warnings.append(
+                "'Locked Matches' is missing a SKU ID or LOCKED Masterlist ID(s) column."
+            )
         else:
             for r in ws.iter_rows(min_row=2, values_only=True):
-                sku = s(r[c_sku - 1]) if c_sku - 1 < len(r) else ""
+                sku = _cell(r, c_sku)
                 mls = split_ids(r[c_ml - 1]) if c_ml - 1 < len(r) else []
                 if sku and mls:
                     reg.locked.setdefault(sku, [])
@@ -449,12 +457,12 @@ def parse_registry(file_bytes: bytes | None) -> ParsedRegistry:
         c_dec = _find_col(idx, "reviewer decision", "decision")
         if c_sku is not None:
             for r in ws.iter_rows(min_row=2, values_only=True):
-                sku = s(r[c_sku - 1]) if c_sku - 1 < len(r) else ""
+                sku = _cell(r, c_sku)
                 if not sku:
                     continue
                 reg.match_review.add(sku)
                 fix = split_ids(r[c_fix - 1]) if c_fix and c_fix - 1 < len(r) else []
-                dec = s(r[c_dec - 1]) if c_dec and c_dec - 1 < len(r) else ""
+                dec = _cell(r, c_dec)
                 # A reviewed + corrected Match Review row is promoted to locked.
                 if fix and classify_decision(dec) == DECISION_LINK:
                     reg.locked.setdefault(sku, [])
@@ -477,10 +485,14 @@ def parse_registry(file_bytes: bytes | None) -> ParsedRegistry:
         idx = _header_index(ws)
         c_id = _find_col(idx, "masterlist stock type id", "stock type id", "stock id")
         if c_id is None:
-            reg.warnings.append(f"'{alias_set[0]}' is missing a Masterlist Stock Type ID column.")
+            # An empty classification sheet is normal, not a problem.
+            if idx:
+                reg.warnings.append(
+                    f"'{alias_set[0]}' is missing a Masterlist Stock Type ID column."
+                )
             continue
         for r in ws.iter_rows(min_row=2, values_only=True):
-            pid = s(r[c_id - 1]) if c_id - 1 < len(r) else ""
+            pid = _cell(r, c_id)
             if pid:
                 target.add(pid)
 
@@ -497,12 +509,12 @@ def parse_registry(file_bytes: bytes | None) -> ParsedRegistry:
         c_note = _find_col(idx, "notes", "note")
         if c_id is not None:
             for r in ws.iter_rows(min_row=2, values_only=True):
-                pid = s(r[c_id - 1]) if c_id - 1 < len(r) else ""
+                pid = _cell(r, c_id)
                 if not pid:
                     continue
-                link = s(r[c_link - 1]) if c_link and c_link - 1 < len(r) else ""
-                dec = s(r[c_dec - 1]) if c_dec and c_dec - 1 < len(r) else ""
-                note = s(r[c_note - 1]) if c_note and c_note - 1 < len(r) else ""
+                link = _cell(r, c_link)
+                dec = _cell(r, c_dec)
+                note = _cell(r, c_note)
                 if dec or link:
                     reg.new_decisions[pid] = (dec, link, note)
 
@@ -517,14 +529,12 @@ def parse_seed_map(file_bytes: bytes | None) -> dict:
         return out
     wb = openpyxl.load_workbook(io.BytesIO(file_bytes), read_only=True, data_only=True)
     ws = wb[wb.sheetnames[0]]
-    idx = {}
     first = True
     c_pos = c_tt = None
     for r in ws.iter_rows(values_only=True):
         if first:
             first = False
-            for i, v in enumerate(r):
-                idx[norm(v)] = i
+            idx = {norm(v): i for i, v in enumerate(r)}
             c_pos = next((i for k, i in idx.items() if "stock" in k and "id" in k), 0)
             c_tt = next((i for k, i in idx.items()
                          if ("variation" in k or "sku" in k) and "id" in k and i != c_pos), 1)
@@ -618,8 +628,7 @@ def build_sync(pos: dict, tt_rows: list, reg: ParsedRegistry, seed: dict | None 
             )
             continue
         if missing_ids:
-            # A Masterlist ID absent from today's stock report means the item has
-            # no stock today -> it contributes 0, and the listing is still synced.
+            # Absent from today's stock report means no stock today -> 0.
             res.zero_stock_notes.append(
                 f"SKU ID {sku}: Masterlist ID(s) {', '.join(missing_ids)} absent from "
                 "today's POS Masterlist — counted as 0."
@@ -683,9 +692,8 @@ def build_sync(pos: dict, tt_rows: list, reg: ParsedRegistry, seed: dict | None 
 
 class MatchIndex:
     """
-    Pre-tokenised inverted index over the TikTok listings so that suggesting
-    matches for one POS item touches only a few hundred candidate rows instead
-    of all ~3,400. Build once per uploaded file and reuse.
+    Pre-tokenised inverted index over the TikTok listings so suggesting matches
+    for one POS item touches a few hundred candidate rows instead of all ~3,400.
     """
 
     _STOP = {"5g", "4g", "gb", "tb", "mm", "new", "used", "sg", "set", "local",
@@ -757,13 +765,6 @@ class MatchIndex:
         return scored[:top]
 
 
-def suggest_matches(item: PosItem, tt_rows_or_index, taken: set | None = None, top: int = 6) -> list:
-    """Accepts either a MatchIndex (fast) or a plain list of TtRow."""
-    idx = (tt_rows_or_index if isinstance(tt_rows_or_index, MatchIndex)
-           else MatchIndex(tt_rows_or_index))
-    return idx.suggest(item, taken, top)
-
-
 # --------------------------------------------------------------------------
 # Exports
 # --------------------------------------------------------------------------
@@ -792,7 +793,8 @@ def _style_header(ws, ncols: int, widths: list | None = None):
         cell.fill = fill
         cell.alignment = Alignment(vertical="center", wrap_text=True)
     ws.freeze_panes = "A2"
-    ws.auto_filter.ref = f"A1:{get_column_letter(ncols)}{max(ws.max_row, 1)}"
+    last = max(dim(ws.max_row, 1), 1)
+    ws.auto_filter.ref = f"A1:{get_column_letter(ncols)}{last}"
     if widths:
         for i, w in enumerate(widths, start=1):
             ws.column_dimensions[get_column_letter(i)].width = w
@@ -818,7 +820,7 @@ def _add_decision_dropdown(ws, col_letter: str, last_row: int):
     dv.add(f"{col_letter}2:{col_letter}{max(last_row, 2)}")
 
 
-def _add_sku_lookup(wb, sku_ids: list):
+def _add_sku_lookup(wb, sku_ids: list) -> int:
     """Hidden sheet holding every valid TikTok SKU ID, for column-H validation."""
     ws = wb.create_sheet(SKU_LOOKUP_SHEET)
     for i, sku in enumerate(sku_ids, start=1):
@@ -902,12 +904,11 @@ def export_registry(res: SyncResult, pos: dict, applied_note: str = "",
         ws.append([i, it.stock_id, it.category, it.brand, it.model, it.color,
                    it.available, "", "", ""])
     _style_header(ws, 10, [5, 22, 12, 14, 30, 18, 13, 24, 24, 26])
-    last = ws.max_row
+    new_sku_last = max(dim(ws.max_row, 1), 1)
     for row in ws.iter_rows(min_row=2, min_col=8, max_col=10):
         for cell in row:
             cell.fill = amber
-    _add_decision_dropdown(ws, "I", last)
-    new_sku_sheet_last = last
+    _add_decision_dropdown(ws, "I", new_sku_last)
 
     # ---- Match Review ---------------------------------------------------
     ws = wb.create_sheet("Match Review")
@@ -946,7 +947,7 @@ def export_registry(res: SyncResult, pos: dict, applied_note: str = "",
     # ---- Hidden SKU lookup + column H validation ------------------------
     if sku_ids:
         n = _add_sku_lookup(wb, sku_ids)
-        _add_sku_validation(wb["New Masterlist SKUs"], "H", new_sku_sheet_last, n)
+        _add_sku_validation(wb["New Masterlist SKUs"], "H", new_sku_last, n)
 
     buf = io.BytesIO()
     wb.save(buf)
@@ -962,7 +963,6 @@ st.set_page_config(page_title="TikTok Stock Sync Tool", page_icon="📦", layout
 st.markdown(
     """
     <style>
-      /* ---- Mister Mobile brand palette ------------------------------- */
       :root {
         --mm-yellow: #FFEB00;
         --mm-black: #111111;
@@ -973,7 +973,6 @@ st.markdown(
 
       .block-container {padding-top: 1.6rem; max-width: 1400px;}
 
-      /* Yellow masthead + black nav strip, mirroring mistermobile.com.sg */
       .mm-hero {background: var(--mm-yellow); padding: 1.05rem 1.4rem;
                 border-radius: 10px 10px 0 0; color: var(--mm-black);}
       .mm-hero h1 {margin:0; font-size:1.55rem; color:var(--mm-black);
@@ -991,7 +990,6 @@ st.markdown(
       div[data-testid="stMetricValue"] {font-size:1.5rem; color:var(--mm-black);}
       div[data-testid="stMetricLabel"] {color:#666;}
 
-      /* Primary buttons: black with yellow text (white on yellow is unreadable) */
       div.stButton > button[kind="primary"],
       div.stDownloadButton > button[kind="primary"] {
         background: var(--mm-black) !important; color: var(--mm-yellow) !important;
@@ -1024,8 +1022,6 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
-
-DECISION_OPTIONS = [DECISION_PENDING, DECISION_LINK, DECISION_NOT_SELLING, DECISION_NOT_ON_TIKTOK]
 
 for key, default in [("decisions", {}), ("filter_text", "")]:
     st.session_state.setdefault(key, default)
@@ -1096,7 +1092,9 @@ except SyncError as e:
     st.error(f"🛑 **Cannot continue** — {e}")
     st.stop()
 except Exception as e:  # noqa: BLE001
-    st.error(f"🛑 Unexpected error while reading files: {e}")
+    st.error(f"🛑 Unexpected error while reading files: {type(e).__name__}: {e}")
+    with st.expander("Technical details (send this if you report the problem)"):
+        st.code(traceback.format_exc())
     st.stop()
 
 match_index = _index(tt_rows, f"{len(tt_bytes)}:{len(tt_rows)}")
